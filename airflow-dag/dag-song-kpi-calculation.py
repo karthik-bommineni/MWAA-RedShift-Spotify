@@ -1,9 +1,10 @@
 from datetime import datetime, timedelta
 from airflow import DAG
-from airflow.operators.python import PythonOperator, BranchPythonOperator
-from airflow.utils.dates import days_ago
-from airflow.operators.dummy import DummyOperator
-from airflow.hooks.postgres_hook import PostgresHook
+from airflow.operators.python import PythonOperator, BranchPythonOperator, get_current_context
+from airflow.utils import timezone
+from airflow.operators.empty import EmptyOperator
+# from airflow.hooks.postgres_hook import PostgresHook (for airflow <2.0)
+from airflow.providers.postgres.hooks.postgres import PostgresHook # (for airflow >=3.0)
 import pandas as pd
 import boto3
 import logging
@@ -11,7 +12,10 @@ import logging
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
-    'start_date': days_ago(1),
+    # Use a timezone-aware datetime compatible with newer Airflow versions (airflow.utils.dates.days_ago might be redundant in airflow >= 3.0)
+    # NOTE: using a dynamic start_date is acceptable for simple dev/testing,
+    # but for production it's better to use a fixed, deterministic start_date.
+    'start_date': timezone.utcnow() - timedelta(days=1),
     'email_on_failure': False,
     'email_on_retry': False,
     'retries': 1,
@@ -19,7 +23,7 @@ default_args = {
 }
 
 # Constants for S3 bucket and file paths
-BUCKET_NAME = 'nl-aws-de-labs'
+BUCKET_NAME = 'nl-airflow-dags-data-karthik'
 SONGS_FILE_PATH = 'spotify_data/songs.csv'
 USERS_FILE_PATH = 'spotify_data/users.csv'
 STREAMS_PREFIX = 'spotify_data/streams/'
@@ -110,9 +114,13 @@ def validate_datasets():
 
     return validation_results
 
-def branch_task(ti):
+def branch_task():
+    # Use the modern context API to access task instance and XComs
+    context = get_current_context()
+    ti = context['ti']
+
     validation_results = ti.xcom_pull(task_ids='validate_datasets')
-    
+
     if all(validation_results.values()):
         return 'calculate_genre_level_kpis'
     else:
@@ -253,7 +261,7 @@ def move_processed_files():
         logging.error(f"Failed to move files from {STREAMS_PREFIX} to {ARCHIVE_PREFIX}: {str(e)}")
         raise
 
-with DAG('data_validation_and_kpi_computation', default_args=default_args, schedule_interval='@daily') as dag:
+with DAG('data_validation_and_kpi_computation', default_args=default_args, schedule='@daily') as dag:
     validate_datasets = PythonOperator(
         task_id='validate_datasets',
         python_callable=validate_datasets
@@ -262,7 +270,6 @@ with DAG('data_validation_and_kpi_computation', default_args=default_args, sched
     check_validation = BranchPythonOperator(
         task_id='check_validation',
         python_callable=branch_task,
-        provide_context=True
     )
 
     calculate_genre_level_kpis = PythonOperator(
@@ -280,7 +287,7 @@ with DAG('data_validation_and_kpi_computation', default_args=default_args, sched
         python_callable=move_processed_files
     )
 
-    end_dag = DummyOperator(
+    end_dag = EmptyOperator(
         task_id='end_dag'
     )
 
